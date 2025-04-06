@@ -27,6 +27,7 @@ from time import time
 import matplotlib.pyplot as plt
 from PIL import Image
 import numpy as np
+import os
 
 
 def parse_opt():
@@ -81,6 +82,13 @@ def parse_opt():
         default="preds",
         required=False,
         help="The name of the column of the csv output file, that contains the predictions per instance",
+    )
+    parser.add_argument(
+        "--logits_col",
+        type=str,
+        default="logits",
+        required=False,
+        help="The prefix of the columns of the csv output file, that contains the logits per instance",
     )
     parser.add_argument(
         "--train",
@@ -218,26 +226,33 @@ def make_model(pth_path=None, nb_classes=40, V1=False):
 
 def get_weights(imgs, img_names, img_weights, weight=None):
     """
-    Returns the list of weights sorted in the same order as the images in the dataloader
-    args:
-        imgs: dataloader ordered list of tuples (image path, truth)
-        img_names: dataframe ordered list of images name
-        img_weights: dataframe ordered list of images weights
+    Returns the list of weights sorted in the same order as the images in the dataloader.
+    
+    Args:
+        imgs: list of tuples (image path, truth) from the dataloader
+        img_names: ordered list (e.g., from a DataFrame column) of image names (without path)
+        img_weights: ordered list (e.g., from a DataFrame column) of weights corresponding to each image name
+        weight: (optional) if provided, a mapping from target to weight
+        
+    Returns:
+        A torch.Tensor containing the weights, as doubles.
     """
     sorted_weights = []
-    if not (weight is None):
+    if weight is not None:
         for img_path, target in imgs:
             sorted_weights.append(weight[target])
     else:
+        # Création d'un dictionnaire pour un accès rapide : nom d'image -> poids
+        img_name_map = dict(zip(img_names, img_weights))
         for img_path, _ in imgs:
-            for idx, val in enumerate(img_names):
-                if val == img_path.split("/")[-1]:
-                    sorted_weights.append(img_weights[idx])
-                    break
+            # Utilisation de os.path.basename pour extraire le nom du fichier
+            img_name = os.path.basename(img_path)
+            if img_name in img_name_map:
+                sorted_weights.append(img_name_map[img_name])
+            else:
+                raise ValueError(f"[ERROR] The image {img_name} does not have a corresponding weight in the CSV.")
+    return torch.tensor(sorted_weights, dtype=torch.float64)
 
-    sorted_weights = torch.Tensor(sorted_weights)
-    sorted_weights = sorted_weights.double()
-    return sorted_weights
 
 
 def get_class_weights(imgs):
@@ -248,11 +263,16 @@ def get_class_weights(imgs):
     return 1.0 / train_class_sample_count
 
 
-def preds_todf(df, dataset, label_decoder, model, preds_col):
+def preds_todf(df, dataset, label_decoder, model, preds_col, logits_col):
+    m = torch.nn.Softmax(dim=1)
     for idx in range(len(dataset.imgs)):
         img_name = dataset.imgs[idx][0].split("/")[-1]
         img, label = dataset.__getitem__(idx)
         pred = model((img.unsqueeze(0), torch.Tensor([label])))
+        logits = pred.detach().cpu()
+        pseudo_proba = m(logits)
+        df.loc[df["Image Index"] == img_name, f"{logits_col}_0"] = pseudo_proba[0][0].item()
+        df.loc[df["Image Index"] == img_name, f"{logits_col}_1"] = pseudo_proba[0][1].item()
         pred = pred.max(1)[1].detach().cpu().item()
         df.loc[df["Image Index"] == img_name, preds_col] = label_decoder[pred]
         df.loc[df["Image Index"] == img_name, "labels"] = label_decoder[label]
@@ -260,7 +280,7 @@ def preds_todf(df, dataset, label_decoder, model, preds_col):
 
 
 def pred_classifier(
-    datadir: str, ckpt_path: str, csv_in: str, csv_out: str, preds_col: str = "preds"
+    datadir: str, ckpt_path: str, csv_in: str, csv_out: str, preds_col: str = "preds", logits_col: str = "logits"
 ):
     """Make prediction with the model on the data
     Args:
@@ -284,12 +304,14 @@ def pred_classifier(
     val_dataset = ImageFolder(valid_datadir, transform=transforms_valid)
     df = pd.read_csv(csv_in)
     df[preds_col] = None
+    df[f"{logits_col}_0"] = None
+    df[f"{logits_col}_1"] = None
     print("Start prediction on train dataset")
     t = time()
-    df = preds_todf(df, train_dataset, label_decoder, model, preds_col)
+    df = preds_todf(df, train_dataset, label_decoder, model, preds_col, logits_col)
     print(f"Predictions done in {time()-t}")
     print("Start prediction on validation dataset")
-    df = preds_todf(df, val_dataset, label_decoder, model, preds_col)
+    df = preds_todf(df, val_dataset, label_decoder, model, preds_col, logits_col)
     print(f"Predictions done in {time()-t}")
     df.to_csv(csv_out, index=False)
     print(balanced_accuracy_score(df.labels, df[preds_col]))
@@ -339,11 +361,13 @@ def train_classifier(
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=32,
+        num_workers=4,
         sampler=WeightedRandomSampler(train_weights, len(train_weights)),
     )
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=32,
+        num_workers=4,
         sampler=WeightedRandomSampler(valid_weights, len(valid_weights)),
     )
     model = ChestXRayClassifier(adamax=True, cosine=True, nb_classes=len(label_encoder))
@@ -378,6 +402,7 @@ if __name__ == "__main__":
                 csv_in=args.csv,
                 csv_out=args.csv_out,
                 preds_col=args.preds_col,
+                logits_col=args.logits_col
             )
     elif args.pred == "True":
         pred_classifier(
